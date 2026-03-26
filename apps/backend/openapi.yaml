@@ -1,0 +1,48 @@
+openapi: 3.0.3
+info:
+  title: NexusBridge Command Center API
+  version: 0.1.0
+servers:
+  - url: http://localhost:3000
+paths:
+  /api/health:
+    get:
+      summary: Health check
+      responses:
+        "200":
+          description: OK
+  /api/auth/login:
+    post:
+      summary: Login
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                email:
+                  type: string
+                password:
+                  type: string
+              required: [email, password]
+      responses:
+        "200":
+          description: Tokens
+  /api/sites:
+    get:
+      summary: List sites
+      responses:
+        "200":
+          description: OK
+    post:
+      summary: Create site
+      responses:
+        "201":
+          description: Created
+  /api/logs/tree:
+    get:
+      summary: List top-level logs directory entries
+      responses:
+        "200":
+          description: OK

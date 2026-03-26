@@ -1,0 +1,24 @@
+server:
+  port: 3000
+  ws_port: 8443
+  host: 0.0.0.0
+
+logging:
+  base_path: ./logs
+  default_rotation_size_mb: 50
+  default_retention_days: 30
+  compression_after_days: 7
+
+security:
+  session_timeout_minutes: 30
+  max_clients: 50
+  wba_auth_timeout_seconds: 60
+  wba_auth_gracetime_seconds: 30
+  wba_ping_enabled: true
+  wba_ping_interval_seconds: 5
+
+bt_defaults:
+  heartbeat_interval_seconds: 30
+  reconnect_attempts: 10
+  command_timeout_seconds: 10
+  max_commands_per_second: 5

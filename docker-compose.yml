@@ -1,0 +1,25 @@
+services:
+  backend:
+    build:
+      context: ./apps/backend-python
+    environment:
+      - JWT_SECRET=${JWT_SECRET}
+      - ADMIN_EMAIL=${ADMIN_EMAIL}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD}
+      - CONFIG_PATH=/app/config.yaml
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./logs:/app/logs
+      - ./data:/app/data
+
+  frontend:
+    build:
+      context: ./apps/frontend
+    environment:
+      - VITE_API_BASE_URL=http://localhost:3000
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
