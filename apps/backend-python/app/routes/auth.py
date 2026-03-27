@@ -1,17 +1,15 @@
 from __future__ import annotations
 
-import json
 import os
-import secrets
-import urllib.parse
-import urllib.request
 from datetime import datetime, timezone
+from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import RedirectResponse
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
 from app.config import AppConfig
+from app.crypto import decrypt_from_b64
 from app.db import Db
 from app.deps import get_cfg, get_db
 from app.auth.deps import get_current_user
@@ -27,10 +25,6 @@ class LoginRequest(BaseModel):
     password: str
 
 
-class OidcLoginResponse(BaseModel):
-    authorization_url: str
-
-
 class ChangePasswordRequest(BaseModel):
     current_password: str
     new_password: str
@@ -39,12 +33,189 @@ class ChangePasswordRequest(BaseModel):
 @router.post("/login")
 async def login(
     body: LoginRequest,
+    request: Request,
     db: Db = Depends(get_db),
     cfg: AppConfig = Depends(get_cfg),
 ):
     ident = (body.username or body.email or "").strip()
     if not ident:
         raise HTTPException(status_code=400, detail="missing_username")
+
+    rs = getattr(request.app.state, "runtime_settings", None)
+    rsd = rs if isinstance(rs, dict) else {}
+
+    def _env_str(name: str) -> str | None:
+        if name not in os.environ:
+            return None
+        return (os.environ.get(name) or "").strip()
+
+    def _env_bool(name: str) -> bool | None:
+        if name not in os.environ:
+            return None
+        raw = (os.environ.get(name) or "").strip().lower()
+        return raw in {"1", "true", "yes", "on"}
+
+    def _rs_str(key: str) -> str:
+        v = rsd.get(key)
+        return (str(v) if v is not None else "").strip()
+
+    def _rs_bool(key: str) -> bool:
+        raw = _rs_str(key).lower()
+        return raw in {"1", "true", "yes", "on"}
+
+    def _effective_str(env_name: str, rs_key: str, default: str = "") -> str:
+        ev = _env_str(env_name)
+        if ev is not None and ev != "":
+            return ev
+        rv = _rs_str(rs_key)
+        if rv:
+            return rv
+        return default
+
+    ev_enabled = _env_bool("LDAP_ENABLED")
+    ldap_enabled = bool(ev_enabled) if ev_enabled is not None else _rs_bool("ldap_enabled")
+
+    if ldap_enabled:
+        ldap_url = _effective_str("LDAP_URL", "ldap_url", "")
+        base_dn = _effective_str("LDAP_BASE_DN", "ldap_base_dn", "")
+        user_filter = _effective_str("LDAP_USER_FILTER", "ldap_user_filter", "(sAMAccountName={username})")
+        user_dn_template = _effective_str("LDAP_USER_DN_TEMPLATE", "ldap_user_dn_template", "")
+        bind_dn = _effective_str("LDAP_BIND_DN", "ldap_bind_dn", "")
+
+        env_bind_pw = _env_str("LDAP_BIND_PASSWORD")
+        if env_bind_pw is not None and env_bind_pw != "":
+            bind_password = env_bind_pw
+        else:
+            bind_password = decrypt_from_b64(_rs_str("ldap_bind_password_enc"))
+
+        group_attr = _effective_str("LDAP_GROUP_ATTR", "ldap_group_attr", "memberOf")
+        mail_attr = _effective_str("LDAP_MAIL_ATTR", "ldap_mail_attr", "mail")
+
+        def _csv(name: str) -> set[str]:
+            ev = _env_str(name)
+            raw = ev if (ev is not None and ev != "") else _rs_str(
+                {
+                    "LDAP_ALLOWED_GROUPS": "ldap_allowed_groups",
+                    "LDAP_ADMIN_GROUPS": "ldap_admin_groups",
+                    "LDAP_OPERATOR_GROUPS": "ldap_operator_groups",
+                    "LDAP_READ_ONLY_GROUPS": "ldap_read_only_groups",
+                }.get(name, "")
+            )
+            out: set[str] = set()
+            for part in raw.split(","):
+                p = part.strip()
+                if p:
+                    out.add(p)
+            return out
+
+        allowed_groups = _csv("LDAP_ALLOWED_GROUPS")
+        admin_groups = _csv("LDAP_ADMIN_GROUPS")
+        operator_groups = _csv("LDAP_OPERATOR_GROUPS")
+        read_only_groups = _csv("LDAP_READ_ONLY_GROUPS")
+
+        if not ldap_url or not base_dn:
+            raise HTTPException(status_code=500, detail="ldap_not_configured")
+
+        def _norm_group_value(v: str) -> str:
+            return (v or "").strip().lower()
+
+        def _map_groups_to_role(groups: set[str]) -> str:
+            gnorm = {_norm_group_value(g) for g in groups}
+            if {_norm_group_value(g) for g in admin_groups} & gnorm:
+                return "admin"
+            if {_norm_group_value(g) for g in operator_groups} & gnorm:
+                return "operator"
+            if {_norm_group_value(g) for g in read_only_groups} & gnorm:
+                return "read_only"
+            return "read_only"
+
+        def _ldap_auth() -> tuple[str, str]:
+            from ldap3 import ALL, Connection, Server
+
+            server = Server(ldap_url, get_info=ALL)
+
+            # Find user DN + attributes.
+            user_dn = ""
+            user_mail = ""
+            user_groups: set[str] = set()
+
+            if user_dn_template:
+                user_dn = user_dn_template.format(username=ident)
+            else:
+                if not bind_dn or not bind_password:
+                    raise HTTPException(status_code=500, detail="ldap_bind_not_configured")
+
+                c = Connection(server, user=bind_dn, password=bind_password, auto_bind=True)
+                f = user_filter.format(username=ident)
+                ok = c.search(search_base=base_dn, search_filter=f, attributes=[group_attr, mail_attr])
+                if not ok or not c.entries:
+                    raise HTTPException(status_code=401, detail="invalid_credentials")
+
+                e = c.entries[0]
+                user_dn = str(getattr(e, "entry_dn", "") or "")
+                try:
+                    if mail_attr and hasattr(e, mail_attr):
+                        mv = getattr(e, mail_attr).value
+                        user_mail = str(mv or "").strip().lower()
+                except Exception:
+                    user_mail = ""
+
+                try:
+                    if group_attr and hasattr(e, group_attr):
+                        g = getattr(e, group_attr).values
+                        if isinstance(g, (list, tuple, set)):
+                            for x in g:
+                                xs = str(x or "").strip()
+                                if xs:
+                                    user_groups.add(xs)
+                        else:
+                            xs = str(g or "").strip()
+                            if xs:
+                                user_groups.add(xs)
+                except Exception:
+                    user_groups = set()
+
+            if not user_dn:
+                raise HTTPException(status_code=401, detail="invalid_credentials")
+
+            # Validate password by binding as user.
+            cu = Connection(server, user=user_dn, password=body.password, auto_bind=True)
+            cu.unbind()
+
+            if allowed_groups:
+                ag = {_norm_group_value(g) for g in allowed_groups}
+                gnorm = {_norm_group_value(g) for g in user_groups}
+                if not (ag & gnorm):
+                    raise HTTPException(status_code=403, detail="not_approved")
+
+            role = _map_groups_to_role(user_groups)
+            email = (user_mail or ident).strip().lower()
+            if not email:
+                email = ident.strip().lower()
+            return email, role
+
+        email, role = await run_in_threadpool(_ldap_auth)
+
+        # Auto-provision/update local user for auditability and admin UI.
+        async with db.conn.execute("SELECT id FROM users WHERE email = ?", (email,)) as cur:
+            row = await cur.fetchone()
+        if row:
+            user_id = str(row[0])
+            await db.conn.execute("UPDATE users SET role = ? WHERE id = ?", (role, user_id))
+        else:
+            user_id = str(uuid4())
+            await db.conn.execute(
+                "INSERT INTO users (id, email, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?)",
+                (user_id, email, hash_password(os.urandom(32).hex()), role, _utcnow()),
+            )
+        await db.conn.commit()
+
+        return {
+            "access_token": sign_access_token(jwt_secret=cfg.security.jwt_secret, sub=user_id, role=role),
+            "refresh_token": sign_refresh_token(jwt_secret=cfg.security.jwt_secret, sub=user_id, role=role),
+        }
+
+    # Local DB auth fallback.
     async with db.conn.execute(
         "SELECT id, password_hash, role FROM users WHERE email = ?", (ident,)
     ) as cur:
@@ -59,9 +230,7 @@ async def login(
 
     return {
         "access_token": sign_access_token(jwt_secret=cfg.security.jwt_secret, sub=user_id, role=role),
-        "refresh_token": sign_refresh_token(
-            jwt_secret=cfg.security.jwt_secret, sub=user_id, role=role
-        ),
+        "refresh_token": sign_refresh_token(jwt_secret=cfg.security.jwt_secret, sub=user_id, role=role),
     }
 
 
@@ -102,202 +271,3 @@ async def change_password(
 
 def _utcnow() -> str:
     return datetime.now(tz=timezone.utc).isoformat()
-
-
-def _env_csv(name: str) -> set[str]:
-    raw = os.environ.get(name) or ""
-    out: set[str] = set()
-    for part in raw.split(","):
-        p = part.strip()
-        if p:
-            out.add(p)
-    return out
-
-
-def _oidc_cfg() -> dict:
-    tenant_id = (os.environ.get("AZURE_AD_TENANT_ID") or os.environ.get("OIDC_AAD_TENANT_ID") or "").strip()
-    client_id = (os.environ.get("AZURE_AD_CLIENT_ID") or os.environ.get("OIDC_CLIENT_ID") or "").strip()
-    client_secret = (os.environ.get("AZURE_AD_CLIENT_SECRET") or os.environ.get("OIDC_CLIENT_SECRET") or "").strip()
-    redirect_uri = (os.environ.get("AZURE_AD_REDIRECT_URI") or os.environ.get("OIDC_REDIRECT_URI") or "").strip()
-
-    if not tenant_id or not client_id or not client_secret or not redirect_uri:
-        raise HTTPException(status_code=500, detail="oidc_not_configured")
-
-    authority = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0"
-    return {
-        "tenant_id": tenant_id,
-        "client_id": client_id,
-        "client_secret": client_secret,
-        "redirect_uri": redirect_uri,
-        "authorize_url": f"{authority}/authorize",
-        "token_url": f"{authority}/token",
-        "jwks_url": f"https://login.microsoftonline.com/{tenant_id}/discovery/v2.0/keys",
-        "scope": (os.environ.get("AZURE_AD_SCOPE") or os.environ.get("OIDC_SCOPE") or "openid profile email").strip(),
-        "admin_group_ids": _env_csv("AZURE_AD_ADMIN_GROUP_IDS") | _env_csv("OIDC_ADMIN_GROUP_IDS"),
-        "operator_group_ids": _env_csv("AZURE_AD_OPERATOR_GROUP_IDS") | _env_csv("OIDC_OPERATOR_GROUP_IDS"),
-        "read_only_group_ids": _env_csv("AZURE_AD_READONLY_GROUP_IDS") | _env_csv("OIDC_READONLY_GROUP_IDS"),
-    }
-
-
-def _http_post_form(url: str, form: dict[str, str]) -> dict:
-    data = urllib.parse.urlencode(form).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/x-www-form-urlencoded"})
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            raw = resp.read().decode("utf-8")
-            return json.loads(raw)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"oidc_token_exchange_failed:{type(e).__name__}")
-
-
-def _http_get_json(url: str) -> dict:
-    req = urllib.request.Request(url)
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            raw = resp.read().decode("utf-8")
-            return json.loads(raw)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"oidc_fetch_failed:{type(e).__name__}")
-
-
-def _map_groups_to_role(groups: set[str], cfg: dict) -> str:
-    if groups & set(cfg.get("admin_group_ids") or set()):
-        return "admin"
-    if groups & set(cfg.get("operator_group_ids") or set()):
-        return "operator"
-    if groups & set(cfg.get("read_only_group_ids") or set()):
-        return "read_only"
-    return "read_only"
-
-
-@router.get("/oidc/login", response_model=OidcLoginResponse)
-async def oidc_login():
-    cfg = _oidc_cfg()
-    state = secrets.token_urlsafe(24)
-    nonce = secrets.token_urlsafe(24)
-
-    params = {
-        "client_id": cfg["client_id"],
-        "response_type": "code",
-        "redirect_uri": cfg["redirect_uri"],
-        "response_mode": "query",
-        "scope": cfg["scope"],
-        "state": state,
-        "nonce": nonce,
-    }
-    url = cfg["authorize_url"] + "?" + urllib.parse.urlencode(params)
-
-    # The frontend can either call this endpoint and redirect, or we can return the URL.
-    return {"authorization_url": url}
-
-
-@router.get("/oidc/callback")
-async def oidc_callback(
-    code: str | None = None,
-    state: str | None = None,
-    error: str | None = None,
-    error_description: str | None = None,
-    db: Db = Depends(get_db),
-    app_cfg: AppConfig = Depends(get_cfg),
-):
-    if error:
-        raise HTTPException(status_code=401, detail=f"oidc_error:{error}")
-    if not code:
-        raise HTTPException(status_code=400, detail="missing_code")
-    _ = state  # reserved for CSRF protection if we add server-side state storage
-
-    ocfg = _oidc_cfg()
-    token = _http_post_form(
-        ocfg["token_url"],
-        {
-            "client_id": ocfg["client_id"],
-            "client_secret": ocfg["client_secret"],
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": ocfg["redirect_uri"],
-        },
-    )
-
-    id_token = str(token.get("id_token") or "")
-    if not id_token:
-        raise HTTPException(status_code=401, detail="missing_id_token")
-
-    # Validate id_token signature with Azure AD JWKS.
-    from jose import jwt  # local import to avoid unused in other deployments
-
-    header = jwt.get_unverified_header(id_token)
-    kid = str(header.get("kid") or "")
-    if not kid:
-        raise HTTPException(status_code=401, detail="missing_kid")
-
-    jwks = _http_get_json(ocfg["jwks_url"])
-    keys = jwks.get("keys") if isinstance(jwks, dict) else None
-    if not isinstance(keys, list):
-        raise HTTPException(status_code=502, detail="invalid_jwks")
-
-    key = None
-    for k in keys:
-        if isinstance(k, dict) and str(k.get("kid") or "") == kid:
-            key = k
-            break
-    if not key:
-        raise HTTPException(status_code=401, detail="jwks_kid_not_found")
-
-    # python-jose can accept a JWK dict as key.
-    try:
-        claims = jwt.decode(
-            id_token,
-            key,
-            algorithms=["RS256"],
-            audience=ocfg["client_id"],
-            options={"verify_at_hash": False},
-        )
-    except Exception as e:
-        raise HTTPException(status_code=401, detail=f"invalid_id_token:{type(e).__name__}")
-
-    # Extract identity.
-    email = (
-        str(claims.get("preferred_username") or "")
-        or str(claims.get("email") or "")
-        or str(claims.get("upn") or "")
-    ).strip().lower()
-    if not email:
-        raise HTTPException(status_code=401, detail="missing_email")
-
-    groups_raw = claims.get("groups")
-    groups: set[str] = set()
-    if isinstance(groups_raw, list):
-        for g in groups_raw:
-            gs = str(g or "").strip()
-            if gs:
-                groups.add(gs)
-
-    role = _map_groups_to_role(groups, ocfg)
-
-    # Auto-provision/update local user for auditability and admin UI.
-    async with db.conn.execute("SELECT id FROM users WHERE email = ?", (email,)) as cur:
-        row = await cur.fetchone()
-
-    if row:
-        user_id = str(row[0])
-        await db.conn.execute("UPDATE users SET role = ? WHERE id = ?", (role, user_id))
-    else:
-        user_id = secrets.token_hex(16)
-        await db.conn.execute(
-            "INSERT INTO users (id, email, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?)",
-            (user_id, email, hash_password(secrets.token_urlsafe(48)), role, _utcnow()),
-        )
-    await db.conn.commit()
-
-    # Issue local JWTs that the frontend/API already understands.
-    access = sign_access_token(jwt_secret=app_cfg.security.jwt_secret, sub=user_id, role=role)
-    refresh = sign_refresh_token(jwt_secret=app_cfg.security.jwt_secret, sub=user_id, role=role)
-
-    # If your frontend is hosted at https://servername/nexus_bridge, you can optionally set
-    # a redirect target via OIDC_UI_REDIRECT (e.g. https://servername/nexus_bridge/#/login).
-    ui_redirect = (os.environ.get("OIDC_UI_REDIRECT") or os.environ.get("AZURE_AD_UI_REDIRECT") or "").strip()
-    if ui_redirect:
-        q = urllib.parse.urlencode({"access_token": access, "refresh_token": refresh})
-        return RedirectResponse(url=f"{ui_redirect}?{q}")
-
-    return {"access_token": access, "refresh_token": refresh}

@@ -699,14 +699,18 @@ def create_app() -> FastAPI:
             async with app.state.db.conn.execute("SELECT key, value FROM app_settings") as cur:
                 rows = await cur.fetchall()
             for k, v in rows:
-                if k == "bt_max_commands_per_second":
+                ks = str(k or "").strip()
+                if not ks:
+                    continue
+
+                if ks == "bt_max_commands_per_second":
                     try:
-                        app.state.runtime_settings["bt_max_commands_per_second"] = int(v)
+                        app.state.runtime_settings[ks] = int(v)
                     except Exception:
-                        pass
-                if k == "log_base_path":
-                    if isinstance(v, str) and v.strip():
-                        app.state.runtime_settings["log_base_path"] = v.strip()
+                        continue
+                else:
+                    # Store raw strings for all other keys.
+                    app.state.runtime_settings[ks] = str(v) if v is not None else ""
         except Exception:
             pass
 
