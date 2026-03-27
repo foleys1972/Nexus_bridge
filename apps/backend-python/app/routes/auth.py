@@ -22,12 +22,18 @@ router = APIRouter(prefix="/auth")
 
 
 class LoginRequest(BaseModel):
-    email: str
+    username: str | None = None
+    email: str | None = None
     password: str
 
 
 class OidcLoginResponse(BaseModel):
     authorization_url: str
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
 
 
 @router.post("/login")
@@ -36,8 +42,11 @@ async def login(
     db: Db = Depends(get_db),
     cfg: AppConfig = Depends(get_cfg),
 ):
+    ident = (body.username or body.email or "").strip()
+    if not ident:
+        raise HTTPException(status_code=400, detail="missing_username")
     async with db.conn.execute(
-        "SELECT id, password_hash, role FROM users WHERE email = ?", (body.email,)
+        "SELECT id, password_hash, role FROM users WHERE email = ?", (ident,)
     ) as cur:
         row = await cur.fetchone()
 
@@ -59,6 +68,36 @@ async def login(
 @router.get("/me")
 async def me(user: dict = Depends(get_current_user)):
     return {"id": user.get("id"), "role": user.get("role")}
+
+
+@router.post("/change-password")
+async def change_password(
+    body: ChangePasswordRequest,
+    db: Db = Depends(get_db),
+    user: dict = Depends(get_current_user),
+):
+    user_id = str(user.get("id") or "")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+    if not body.new_password or len(body.new_password) < 8:
+        raise HTTPException(status_code=400, detail="password_too_short")
+
+    async with db.conn.execute("SELECT password_hash FROM users WHERE id = ?", (user_id,)) as cur:
+        row = await cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="not_found")
+
+    password_hash = row[0]
+    if not verify_password(body.current_password, password_hash):
+        raise HTTPException(status_code=401, detail="invalid_credentials")
+
+    await db.conn.execute(
+        "UPDATE users SET password_hash = ? WHERE id = ?",
+        (hash_password(body.new_password), user_id),
+    )
+    await db.conn.commit()
+    return {"ok": True}
 
 
 def _utcnow() -> str:

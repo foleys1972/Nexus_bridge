@@ -4,6 +4,8 @@ import asyncio
 from pathlib import Path
 from typing import AsyncGenerator
 
+from fastapi import Query
+
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -22,16 +24,27 @@ async def tree(
     request: Request,
     cfg: AppConfig = Depends(get_cfg),
     _user: dict = Depends(require_read_only),
+    path: str | None = Query(default=None),
 ):
     root = Path(effective_log_base_path(cfg, getattr(request.app.state, "runtime_settings", None))).resolve()
     if not root.exists():
-        return {"root": str(root), "entries": []}
+        return {"root": str(root), "path": "", "entries": []}
+
+    rel = (path or "").strip().lstrip("/\\")
+    target = (root / rel).resolve()
+    try:
+        target.relative_to(root)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid_path")
+
+    if not target.exists() or not target.is_dir():
+        raise HTTPException(status_code=404, detail="dir_not_found")
 
     entries = []
-    for d in sorted(root.iterdir(), key=lambda p: p.name.lower()):
+    for d in sorted(target.iterdir(), key=lambda p: p.name.lower()):
         entries.append({"name": d.name, "type": "dir" if d.is_dir() else "file"})
 
-    return {"root": str(root), "entries": entries}
+    return {"root": str(root), "path": rel, "entries": entries}
 
 
 class EmitLogRequest(BaseModel):

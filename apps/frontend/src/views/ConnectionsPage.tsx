@@ -1,8 +1,7 @@
 import React from "react";
+import { apiFetch } from "../api";
 
 export function ConnectionsPage() {
-  const apiBase = (import.meta as any).env?.VITE_API_BASE_URL || "http://localhost:3000";
-
   const pollCommands = React.useMemo(
     () => [
       "get_calls",
@@ -53,7 +52,7 @@ export function ConnectionsPage() {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch(`${apiBase}/api/sites`);
+      const res = await apiFetch("/api/sites");
       if (!res.ok) throw new Error(`failed_to_load_sites_${res.status}`);
       const json = await res.json();
       setSites(json.sites ?? []);
@@ -62,7 +61,7 @@ export function ConnectionsPage() {
       await Promise.all(
         (json.sites ?? []).map(async (s: Site) => {
           try {
-            const rr = await fetch(`${apiBase}/api/sites/${s.id}/poll-rules`);
+            const rr = await apiFetch(`/api/sites/${s.id}/poll-rules`);
             if (!rr.ok) return;
             const rj = await rr.json();
             const rules: PollRule[] = rj.rules ?? [];
@@ -81,7 +80,7 @@ export function ConnectionsPage() {
     } finally {
       setLoading(false);
     }
-  }, [apiBase, pollCommands]);
+  }, [pollCommands]);
 
   const [editName, setEditName] = React.useState("");
   const [editWssUrl, setEditWssUrl] = React.useState("");
@@ -112,7 +111,7 @@ export function ConnectionsPage() {
       if (editToken) {
         patch.token = editToken;
       }
-      await fetch(`${apiBase}/api/sites/${editSiteId}`, {
+      await apiFetch(`/api/sites/${editSiteId}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(patch)
@@ -122,7 +121,7 @@ export function ConnectionsPage() {
     } finally {
       setEditSaving(false);
     }
-  }, [apiBase, editLat, editLng, editName, editSiteId, editToken, editWssUrl, loadSites]);
+  }, [editLat, editLng, editName, editSiteId, editToken, editWssUrl, loadSites]);
 
   type CreatedConnection = {
     id: string;
@@ -163,25 +162,25 @@ export function ConnectionsPage() {
 
   const loadConnections = React.useCallback(async () => {
     try {
-      const res = await fetch(`${apiBase}/api/connections`);
+      const res = await apiFetch("/api/connections");
       if (!res.ok) return;
       const json = await res.json();
       setExistingConnections(json.connections ?? []);
     } catch {
       setExistingConnections([]);
     }
-  }, [apiBase]);
+  }, []);
 
   const loadActiveConnections = React.useCallback(async () => {
     try {
-      const res = await fetch(`${apiBase}/api/connections/active`);
+      const res = await apiFetch("/api/connections/active");
       if (!res.ok) return;
       const json = await res.json();
       setActiveConnections(json.active ?? []);
     } catch {
       setActiveConnections([]);
     }
-  }, [apiBase]);
+  }, []);
 
   const [newSiteName, setNewSiteName] = React.useState("");
   const [newWssUrl, setNewWssUrl] = React.useState("");
@@ -252,7 +251,7 @@ export function ConnectionsPage() {
         enhanced_messaging: editConnEnhanced,
         allowed_site_ids
       };
-      await fetch(`${apiBase}/api/connections/${editConnId}`, {
+      await apiFetch(`/api/connections/${editConnId}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(patch)
@@ -263,7 +262,7 @@ export function ConnectionsPage() {
     } finally {
       setEditConnSaving(false);
     }
-  }, [apiBase, editConnAllowedSiteIds, editConnEnhanced, editConnId, editConnLat, editConnLng, editConnName, loadActiveConnections, loadConnections, sites]);
+  }, [editConnAllowedSiteIds, editConnEnhanced, editConnId, editConnLat, editConnLng, editConnName, loadActiveConnections, loadConnections, sites]);
 
   const editConnModal = React.useMemo(() => {
     if (!editConnId) return null;
@@ -352,46 +351,46 @@ export function ConnectionsPage() {
         Pick<Site, "subscribe_calls" | "subscribe_presence" | "subscribe_alerts" | "subscribe_events" | "is_active">
       >
     ) => {
-      await fetch(`${apiBase}/api/sites/${id}`, {
+      await apiFetch(`/api/sites/${id}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(patch)
       });
       await loadSites();
     },
-    [apiBase, loadSites]
+    [loadSites]
   );
 
   const connectSite = React.useCallback(
     async (id: string) => {
-      await fetch(`${apiBase}/api/sites/${id}/connect`, { method: "POST" });
+      await apiFetch(`/api/sites/${id}/connect`, { method: "POST" });
       await loadSites();
     },
-    [apiBase, loadSites]
+    [loadSites]
   );
 
   const disconnectSite = React.useCallback(
     async (id: string) => {
-      await fetch(`${apiBase}/api/sites/${id}/disconnect`, { method: "POST" });
+      await apiFetch(`/api/sites/${id}/disconnect`, { method: "POST" });
       await loadSites();
     },
-    [apiBase, loadSites]
+    [loadSites]
   );
 
   const deleteSite = React.useCallback(
     async (id: string) => {
       const ok = window.confirm("Delete this site? This will remove its polling rules/state.");
       if (!ok) return;
-      await fetch(`${apiBase}/api/sites/${id}`, { method: "DELETE" });
+      await apiFetch(`/api/sites/${id}`, { method: "DELETE" });
       await loadSites();
     },
-    [apiBase, loadSites]
+    [loadSites]
   );
 
   const createSite = React.useCallback(async () => {
     setError(null);
     try {
-      const res = await fetch(`${apiBase}/api/sites`, {
+      const res = await apiFetch("/api/sites", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -417,7 +416,7 @@ export function ConnectionsPage() {
     } catch (e: any) {
       setError(e?.message ?? "failed_to_create_site");
     }
-  }, [apiBase, loadSites, newSiteName, newToken, newWssUrl, subAlerts, subCalls, subEvents, subPresence]);
+  }, [loadSites, newSiteName, newToken, newWssUrl, subAlerts, subCalls, subEvents, subPresence]);
 
   const [connLat, setConnLat] = React.useState("");
   const [connLng, setConnLng] = React.useState("");
@@ -439,7 +438,7 @@ export function ConnectionsPage() {
       const rules = pollRulesBySiteId[siteId] ?? [];
       setPollSavingBySiteId((p: Record<string, boolean>) => ({ ...p, [siteId]: true }));
       try {
-        const res = await fetch(`${apiBase}/api/sites/${siteId}/poll-rules`, {
+        const res = await apiFetch(`/api/sites/${siteId}/poll-rules`, {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ rules })
@@ -450,7 +449,7 @@ export function ConnectionsPage() {
         setPollSavingBySiteId((p: Record<string, boolean>) => ({ ...p, [siteId]: false }));
       }
     },
-    [apiBase, pollRulesBySiteId]
+    [pollRulesBySiteId, loadSites]
   );
 
   const createConnectionToken = React.useCallback(async () => {
@@ -458,7 +457,7 @@ export function ConnectionsPage() {
     setConnCreating(true);
     try {
       const allowed_site_ids = sites.filter((s) => !!connAllowedSiteIds[s.id]).map((s) => s.id);
-      const res = await fetch(`${apiBase}/api/connections/token`, {
+      const res = await apiFetch("/api/connections/token", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -477,20 +476,20 @@ export function ConnectionsPage() {
     } finally {
       setConnCreating(false);
     }
-  }, [apiBase, connAllowedSiteIds, connName, loadConnections, sites, connLat, connLng]);
+  }, [connAllowedSiteIds, connName, loadConnections, sites, connLat, connLng]);
 
   const revokeConnectionToken = React.useCallback(async () => {
     if (!createdConn) return;
     setConnError(null);
     try {
-      const res = await fetch(`${apiBase}/api/connections/${createdConn.id}/revoke`, { method: "POST" });
+      const res = await apiFetch(`/api/connections/${createdConn.id}/revoke`, { method: "POST" });
       if (!res.ok) throw new Error(`failed_to_revoke_${res.status}`);
       setCreatedConn(null);
       await loadConnections();
     } catch (e: any) {
       setConnError(e?.message ?? "failed_to_revoke");
     }
-  }, [apiBase, createdConn, loadConnections]);
+  }, [createdConn, loadConnections]);
 
   const PollRulesModal = React.useCallback(
     ({ site }: { site: Site }) => {
@@ -979,7 +978,7 @@ export function ConnectionsPage() {
                             className="rounded bg-rose-700 px-3 py-2 text-white disabled:opacity-50"
                             disabled={c.revoked}
                             onClick={async () => {
-                              await fetch(`${apiBase}/api/connections/${c.id}/revoke`, { method: "POST" });
+                              await apiFetch(`/api/connections/${c.id}/revoke`, { method: "POST" });
                               await loadConnections();
                               await loadActiveConnections();
                             }}

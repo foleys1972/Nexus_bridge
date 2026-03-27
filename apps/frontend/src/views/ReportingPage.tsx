@@ -1,4 +1,5 @@
 import React from "react";
+import { apiFetch } from "../api";
 
 type TrafficSnapshot = {
   window_seconds: number;
@@ -9,22 +10,20 @@ type TrafficSnapshot = {
 };
 
 export function ReportingPage() {
-  const apiBase = (import.meta as any).env?.VITE_API_BASE_URL || "http://localhost:3000";
-
   const [data, setData] = React.useState<TrafficSnapshot | null>(null);
   const [error, setError] = React.useState<string | null>(null);
 
   const load = React.useCallback(async () => {
     setError(null);
     try {
-      const res = await fetch(`${apiBase}/api/metrics/traffic`);
+      const res = await apiFetch("/api/metrics/traffic");
       if (!res.ok) throw new Error(`failed_to_load_${res.status}`);
       const json = (await res.json()) as TrafficSnapshot;
       setData(json);
     } catch (e: any) {
       setError(e?.message ?? "failed_to_load");
     }
-  }, [apiBase]);
+  }, []);
 
   React.useEffect(() => {
     void load();

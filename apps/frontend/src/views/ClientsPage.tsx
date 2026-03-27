@@ -1,8 +1,7 @@
 import React from "react";
+import { apiFetch } from "../api";
 
 export function ClientsPage() {
-  const apiBase = (import.meta as any).env?.VITE_API_BASE_URL || "http://localhost:3000";
-
   type ActiveConnection = {
     conn_id: string;
     name?: string;
@@ -19,7 +18,7 @@ export function ClientsPage() {
   const load = React.useCallback(async () => {
     try {
       setError(null);
-      const res = await fetch(`${apiBase}/api/connections/active`);
+      const res = await apiFetch("/api/connections/active");
       if (!res.ok) throw new Error(`failed_to_load_${res.status}`);
       const json = await res.json();
       setActive(json.active ?? []);
@@ -27,7 +26,7 @@ export function ClientsPage() {
       setError(e?.message ?? "failed_to_load");
       setActive([]);
     }
-  }, [apiBase]);
+  }, []);
 
   React.useEffect(() => {
     void load();

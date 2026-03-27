@@ -1,6 +1,7 @@
 import React from "react";
 import { MapContainer, Marker, Popup, TileLayer, useMap } from "react-leaflet";
 import L from "leaflet";
+import { apiFetch } from "../api";
 
 type Site = {
   id: string;
@@ -60,7 +61,6 @@ const revokedIntegrationIcon = new L.DivIcon({
 });
 
 export function DashboardPage() {
-  const apiBase = (import.meta as any).env?.VITE_API_BASE_URL || "http://localhost:3000";
   const [sites, setSites] = React.useState<Site[]>([]);
   const [integrations, setIntegrations] = React.useState<Integration[]>([]);
   const [error, setError] = React.useState<string | null>(null);
@@ -68,7 +68,7 @@ export function DashboardPage() {
   const load = React.useCallback(async () => {
     setError(null);
     try {
-      const [sr, cr] = await Promise.all([fetch(`${apiBase}/api/sites`), fetch(`${apiBase}/api/connections`)]);
+      const [sr, cr] = await Promise.all([apiFetch("/api/sites"), apiFetch("/api/connections")]);
       if (!sr.ok) throw new Error(`failed_to_load_sites_${sr.status}`);
       if (!cr.ok) throw new Error(`failed_to_load_connections_${cr.status}`);
       const sj = await sr.json();
@@ -78,7 +78,7 @@ export function DashboardPage() {
     } catch (e: any) {
       setError(e?.message ?? "failed_to_load");
     }
-  }, [apiBase]);
+  }, []);
 
   React.useEffect(() => {
     void load();

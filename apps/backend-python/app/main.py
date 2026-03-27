@@ -11,12 +11,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 import time
+import gzip
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 import websockets
 
 from app.config import AppConfig, load_config
+from app.config import effective_log_base_path
 from app.db import Db, init_db
 from app.auth.passwords import hash_password
 from app.routes import health as health_route
@@ -91,6 +93,137 @@ def create_app() -> FastAPI:
             ),
         )
         await app.state.db.conn.commit()
+
+    GET_COMMANDS: set[str] = {
+        "get_calls",
+        "get_zones",
+        "get_users",
+        "get_turrets",
+        "get_events",
+        "get_version",
+        "get_tpos",
+        "get_lines",
+        "get_shared_profiles",
+        "get_health_api_report",
+    }
+
+    def _latest_log_file(dir_path: Path) -> Path | None:
+        if not dir_path.exists() or not dir_path.is_dir():
+            return None
+        latest: Path | None = None
+        latest_mtime = -1.0
+        for p in dir_path.glob("*.log"):
+            if not p.is_file():
+                continue
+            try:
+                mtime = p.stat().st_mtime
+            except OSError:
+                continue
+            if mtime > latest_mtime:
+                latest = p
+                latest_mtime = mtime
+        for p in dir_path.glob("*.log.gz"):
+            if not p.is_file():
+                continue
+            try:
+                mtime = p.stat().st_mtime
+            except OSError:
+                continue
+            if mtime > latest_mtime:
+                latest = p
+                latest_mtime = mtime
+        return latest
+
+    def _read_last_json_line(path: Path) -> dict | None:
+        try:
+            if path.name.endswith(".gz"):
+                with gzip.open(path, "rt", encoding="utf-8", errors="ignore") as f:
+                    lines = f.read().splitlines()
+            else:
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    lines = f.read().splitlines()
+        except OSError:
+            return None
+
+        for raw in reversed(lines):
+            s = (raw or "").strip()
+            if not s:
+                continue
+            try:
+                v = json.loads(s)
+            except Exception:
+                continue
+            if isinstance(v, dict):
+                return v
+        return None
+
+    async def _get_cached_poll_response(*, site_id: str, command: str) -> dict | None:
+        if command not in GET_COMMANDS:
+            return None
+        base = Path(effective_log_base_path(app.state.cfg, getattr(app.state, "runtime_settings", None))).resolve()
+        dir_path = base / site_id / command
+        latest = await asyncio.to_thread(_latest_log_file, dir_path)
+        if not latest:
+            return None
+        entry = await asyncio.to_thread(_read_last_json_line, latest)
+        if not entry:
+            return None
+        payload = entry.get("payload")
+        poll_args = entry.get("args") if isinstance(entry.get("args"), dict) else None
+        if isinstance(payload, dict):
+            out = dict(payload)
+            if isinstance(poll_args, dict):
+                out["_nb_poll_args"] = poll_args
+            return out
+        return None
+
+    def _is_cache_compatible(*, command: str, req_args: dict[str, Any], cached_resp: dict[str, Any]) -> bool:
+        poll_args = cached_resp.get("_nb_poll_args") if isinstance(cached_resp.get("_nb_poll_args"), dict) else {}
+
+        # Remove non-filter routing hints
+        req_args = {k: v for k, v in (req_args or {}).items() if k != "site_id"}
+
+        # If the caller wants any args and we don't know what the poll used, be conservative.
+        if req_args and not poll_args:
+            return False
+
+        # get_calls: allow cache if request.from_id >= poll.from_id (cache is a subset of newer calls)
+        if command == "get_calls":
+            req_from = req_args.get("from_id")
+            poll_from = poll_args.get("from_id")
+            if req_from is None:
+                # request wants default (server decides). cached poll is acceptable.
+                return True
+            if poll_from is None:
+                return False
+            try:
+                return int(req_from) >= int(poll_from)
+            except Exception:
+                return False
+
+        # get_events: must match category; allow from_id rule as above
+        if command == "get_events":
+            req_cat = req_args.get("category")
+            poll_cat = poll_args.get("category")
+            if req_cat is not None and poll_cat is not None and str(req_cat) != str(poll_cat):
+                return False
+            if req_cat is not None and poll_cat is None:
+                return False
+            req_from = req_args.get("from_id")
+            poll_from = poll_args.get("from_id")
+            if req_from is None:
+                return True
+            if poll_from is None:
+                return False
+            try:
+                return int(req_from) >= int(poll_from)
+            except Exception:
+                return False
+
+        # Default: exact args match. If request sends no args, cache is fine.
+        if not req_args:
+            return True
+        return req_args == poll_args
 
     async def _load_subscribe_categories(app: FastAPI, *, site_id: str) -> set[str]:
         async with app.state.db.conn.execute(
@@ -254,7 +387,7 @@ def create_app() -> FastAPI:
 
     async def _poll_once(app: FastAPI, c: _WbaClient, command: str) -> None:
         rotation = RotationPolicy(max_size_bytes=app.state.cfg.logging.default_rotation_size_mb * 1024 * 1024)
-        root = Path(app.state.cfg.logging.base_path).resolve()
+        root = Path(effective_log_base_path(app.state.cfg, getattr(app.state, "runtime_settings", None))).resolve()
         timeout_s = float(app.state.cfg.bt_defaults.command_timeout_seconds)
 
         async def emit(payload: dict[str, Any]) -> None:
@@ -297,6 +430,7 @@ def create_app() -> FastAPI:
                         "site_id": c.site_id,
                         "type": "poll_result",
                         "command": "get_calls",
+                        "args": dict(args),
                         "payload": resp,
                     }
                 )
@@ -340,6 +474,7 @@ def create_app() -> FastAPI:
                             "type": "poll_result",
                             "command": "get_events",
                             "category": category,
+                            "args": dict(args),
                             "payload": resp,
                         }
                     )
@@ -352,9 +487,10 @@ def create_app() -> FastAPI:
             return
 
         ref = str(uuid4())
-        req = {"command": command, "command_ref": ref, "args": {}}
+        args: dict[str, Any] = {}
+        req = {"command": command, "command_ref": ref, "args": args}
         resp = await _wba_request(c, req, timeout_s=timeout_s)
-        await emit({"site_id": c.site_id, "type": "poll_result", "command": command, "payload": resp})
+        await emit({"site_id": c.site_id, "type": "poll_result", "command": command, "args": dict(args), "payload": resp})
 
     async def _poll_rule_loop(app: FastAPI, c: _WbaClient, command: str, interval_seconds: int) -> None:
         while not c.stop.is_set():
@@ -593,11 +729,19 @@ def create_app() -> FastAPI:
 
         app.state.polling_task = asyncio.create_task(_polling_supervisor(app))
 
-        admin_email = os.environ.get("ADMIN_EMAIL")
-        admin_password = os.environ.get("ADMIN_PASSWORD")
-        if admin_email and admin_password:
+        admin_ident = (os.environ.get("ADMIN_USERNAME") or os.environ.get("ADMIN_EMAIL") or "").strip()
+        admin_password = (os.environ.get("ADMIN_PASSWORD") or "").strip()
+
+        async with app.state.db.conn.execute("SELECT COUNT(1) FROM users") as cur:
+            row = await cur.fetchone()
+        user_count = int(row[0] if row else 0)
+
+        # Bootstrap rules:
+        # - If env vars are provided, ensure that user exists.
+        # - Otherwise, if DB has no users, create default admin/admin.
+        if admin_ident and admin_password:
             async with app.state.db.conn.execute(
-                "SELECT id FROM users WHERE email = ?", (admin_email,)
+                "SELECT id FROM users WHERE email = ?", (admin_ident,)
             ) as cur:
                 row = await cur.fetchone()
 
@@ -606,8 +750,34 @@ def create_app() -> FastAPI:
                     "INSERT INTO users (id, email, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?)",
                     (
                         str(uuid4()),
-                        admin_email,
+                        admin_ident,
                         hash_password(admin_password),
+                        "admin",
+                        datetime.now(tz=timezone.utc).isoformat(),
+                    ),
+                )
+                await app.state.db.conn.commit()
+            else:
+                # Allow credential reset via env vars.
+                await app.state.db.conn.execute(
+                    "UPDATE users SET password_hash = ?, role = ? WHERE email = ?",
+                    (hash_password(admin_password), "admin", admin_ident),
+                )
+                await app.state.db.conn.commit()
+        else:
+            # Default local admin: ensure it exists so a fresh install always has a working login.
+            # If you'd like to override this, set ADMIN_USERNAME + ADMIN_PASSWORD.
+            async with app.state.db.conn.execute(
+                "SELECT id FROM users WHERE email = ?", ("admin",)
+            ) as cur:
+                row = await cur.fetchone()
+            if not row:
+                await app.state.db.conn.execute(
+                    "INSERT INTO users (id, email, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (
+                        str(uuid4()),
+                        "admin",
+                        hash_password("admin"),
                         "admin",
                         datetime.now(tz=timezone.utc).isoformat(),
                     ),
@@ -895,6 +1065,22 @@ def create_app() -> FastAPI:
                             upstream_payload["args"] = {k: v for k, v in (upstream_payload.get("args") or {}).items() if k != "site_id"}
 
                         try:
+                            cached = None
+                            if cmd in GET_COMMANDS:
+                                cached = await _get_cached_poll_response(site_id=site_id, command=cmd)
+                            if isinstance(cached, dict):
+                                if _is_cache_compatible(command=cmd, req_args=margs or {}, cached_resp=cached):
+                                    out = dict(cached)
+                                    out.pop("_nb_poll_args", None)
+                                    out["command"] = "response"
+                                    out["command_ref"] = ref
+                                    if "success" not in out:
+                                        out["success"] = bool(out.get("ok"))
+                                        out.pop("ok", None)
+                                    await ws.send_text(json.dumps(out))
+                                    await metrics.inc_down_out(str(conn_id))
+                                    return
+
                             resp = await _wba_request(
                                 upstream,
                                 upstream_payload,
@@ -927,6 +1113,13 @@ def create_app() -> FastAPI:
                                 await _send_downstream_response(ref=ref, success=False, error="site_id_required")
                                 await metrics.inc_down_out(str(conn_id))
                                 continue
+                        await _route_to_site(site_id=site_id)
+                        continue
+
+                    # Legacy cached GET support: if not enhanced and exactly one site allowed,
+                    # satisfy get_* from cached poll log (or fallback to upstream).
+                    if (not client.enhanced_messaging) and cmd in GET_COMMANDS and len(client.allowed_site_ids) == 1:
+                        site_id = next(iter(client.allowed_site_ids))
                         await _route_to_site(site_id=site_id)
                         continue
 
