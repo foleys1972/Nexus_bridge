@@ -84,6 +84,13 @@ def main() -> None:
     host = os.environ.get("NB_HOST") or "0.0.0.0"
     port = int(os.environ.get("NB_PORT") or "3000")
 
+    ws_ping_interval_s = int(os.environ.get("NB_WBA_PING_INTERVAL_SECONDS") or "5")
+    ws_ping_timeout_s = int(os.environ.get("NB_WBA_PING_TIMEOUT_SECONDS") or "20")
+    if ws_ping_interval_s < 1:
+        ws_ping_interval_s = 5
+    if ws_ping_timeout_s < 1:
+        ws_ping_timeout_s = max(10, ws_ping_interval_s * 2)
+
     from app.main import app as fastapi_app
 
     try:
@@ -93,8 +100,8 @@ def main() -> None:
             port=port,
             log_level="debug",
             access_log=True,
-            ws_ping_interval=None,
-            ws_ping_timeout=None,
+            ws_ping_interval=ws_ping_interval_s,
+            ws_ping_timeout=ws_ping_timeout_s,
         )
         print("\nNexusBridge server stopped.", flush=True)
         if _is_frozen():

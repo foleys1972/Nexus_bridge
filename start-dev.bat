@@ -66,7 +66,7 @@ set "LOG_BASE_PATH=%ROOT%\logs"
 if not exist "%LOG_BASE_PATH%" mkdir "%LOG_BASE_PATH%"
 echo Backend CONFIG_PATH=%CONFIG_PATH%
 echo Backend LOG_BASE_PATH=%LOG_BASE_PATH%
-python -m uvicorn app.main:app --host 0.0.0.0 --port 3000
+python -m uvicorn app.main:app --host 0.0.0.0 --port 3000 --ws-ping-interval 5 --ws-ping-timeout 20
 popd
 
 echo Started frontend and backend.
