@@ -1,10 +1,20 @@
 import React from "react";
-import { NavLink, Outlet } from "react-router-dom";
+import { NavLink, Outlet, useNavigate } from "react-router-dom";
+
+import { clearTokens, getAccessToken } from "../auth";
 
 const linkBase =
   "block rounded px-3 py-2 text-sm transition hover:bg-slate-900 hover:text-white";
 
 export function AppLayout() {
+  const nav = useNavigate();
+  const [hasToken, setHasToken] = React.useState<boolean>(() => !!getAccessToken());
+
+  React.useEffect(() => {
+    const id = window.setInterval(() => setHasToken(!!getAccessToken()), 500);
+    return () => window.clearInterval(id);
+  }, []);
+
   return (
     <div className="min-h-screen grid grid-cols-[260px_1fr]">
       <aside className="border-r border-slate-800 bg-slate-950 p-4">
@@ -71,6 +81,27 @@ export function AppLayout() {
       </aside>
 
       <main className="p-6">
+        <div className="mb-4 flex items-center justify-end">
+          {hasToken ? (
+            <button
+              className="rounded bg-slate-800 px-3 py-2 text-sm text-white"
+              onClick={() => {
+                clearTokens();
+                setHasToken(false);
+                nav("/login", { replace: true });
+              }}
+            >
+              Logout
+            </button>
+          ) : (
+            <button
+              className="rounded bg-sky-600 px-3 py-2 text-sm text-white"
+              onClick={() => nav("/login")}
+            >
+              Login
+            </button>
+          )}
+        </div>
         <Outlet />
       </main>
     </div>

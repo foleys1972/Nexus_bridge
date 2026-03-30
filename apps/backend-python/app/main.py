@@ -13,7 +13,9 @@ from typing import Any
 import time
 import gzip
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 import websockets
 
@@ -44,6 +46,33 @@ def create_app() -> FastAPI:
 
     log = logging.getLogger("uvicorn.error")
 
+    app.state.down_inflight_lock = asyncio.Lock()
+    app.state.down_inflight_by_conn_id: dict[str, int] = {}
+
+    base_dir = Path(os.environ.get("NB_BASE_DIR") or Path.cwd()).resolve()
+    frontend_dir = Path(os.environ.get("NB_FRONTEND_DIR") or (base_dir / "frontend")).resolve()
+    index_html = frontend_dir / "index.html"
+    if index_html.exists():
+        assets_dir = frontend_dir / "assets"
+        if assets_dir.exists() and assets_dir.is_dir():
+            app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
+
+        @app.get("/", include_in_schema=False)
+        async def root_index():
+            return FileResponse(str(index_html))
+
+        @app.middleware("http")
+        async def spa_404_fallback(request: Request, call_next):
+            response = await call_next(request)
+            if request.method != "GET":
+                return response
+            path = request.url.path or "/"
+            if path.startswith("/api") or path.startswith("/ws") or path.startswith("/assets"):
+                return response
+            if response.status_code != 404:
+                return response
+            return FileResponse(str(index_html))
+
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[
@@ -69,6 +98,45 @@ def create_app() -> FastAPI:
         stop: asyncio.Event
         throttle_lock: asyncio.Lock
         next_send_at: float
+
+    async def _get_overload_limits() -> tuple[int, int]:
+        runtime = getattr(app.state, "runtime_settings", None)
+        soft = int((runtime or {}).get("downstream_overload_max_inflight") or 100)
+        hard = int((runtime or {}).get("downstream_overload_hard_max_inflight") or 200)
+        if soft < 1:
+            soft = 1
+        if hard < soft:
+            hard = soft
+        return soft, hard
+
+    async def _overload_should_drop(conn_id: str) -> bool:
+        soft, hard = await _get_overload_limits()
+        async with app.state.down_inflight_lock:
+            inflight_by = app.state.down_inflight_by_conn_id
+            total = sum(inflight_by.values())
+            if total < soft:
+                return False
+            worst_conn = None
+            worst_n = -1
+            for cid, n in inflight_by.items():
+                if n > worst_n:
+                    worst_conn = cid
+                    worst_n = n
+            if total >= hard:
+                return True
+            return bool(worst_conn == conn_id)
+
+    async def _overload_inflight_inc(conn_id: str) -> None:
+        async with app.state.down_inflight_lock:
+            app.state.down_inflight_by_conn_id[conn_id] = int(app.state.down_inflight_by_conn_id.get(conn_id, 0) or 0) + 1
+
+    async def _overload_inflight_dec(conn_id: str) -> None:
+        async with app.state.down_inflight_lock:
+            cur = int(app.state.down_inflight_by_conn_id.get(conn_id, 0) or 0) - 1
+            if cur <= 0:
+                app.state.down_inflight_by_conn_id.pop(conn_id, None)
+            else:
+                app.state.down_inflight_by_conn_id[conn_id] = cur
 
     async def _set_site_status(
         app: FastAPI,
@@ -906,10 +974,26 @@ def create_app() -> FastAPI:
         reauth_notified = False
         ws_closed = False
 
-        ping_enabled = bool(getattr(app.state.cfg.security, "wba_ping_enabled", True))
-        ping_interval_s = int(getattr(app.state.cfg.security, "wba_ping_interval_seconds", 5) or 5)
+        rs = getattr(app.state, "runtime_settings", None)
+        rs_ping_enabled = None
+        if isinstance(rs, dict) and "wba_ping_enabled" in rs:
+            rs_ping_enabled = str(rs.get("wba_ping_enabled") or "").strip().lower() in {"1", "true", "yes", "on"}
+        ping_enabled = bool(rs_ping_enabled) if rs_ping_enabled is not None else bool(getattr(app.state.cfg.security, "wba_ping_enabled", True))
+
+        rs_ping_interval = None
+        if isinstance(rs, dict) and "wba_ping_interval_seconds" in rs:
+            try:
+                rs_ping_interval = int(rs.get("wba_ping_interval_seconds") or 0)
+            except Exception:
+                rs_ping_interval = None
+        ping_interval_s = int(rs_ping_interval or getattr(app.state.cfg.security, "wba_ping_interval_seconds", 5) or 5)
         if ping_interval_s < 1:
             ping_interval_s = 1
+
+        rs_ping_notification_enabled = None
+        if isinstance(rs, dict) and "wba_ping_notification_enabled" in rs:
+            rs_ping_notification_enabled = str(rs.get("wba_ping_notification_enabled") or "").strip().lower() in {"1", "true", "yes", "on"}
+        ping_notification_enabled = bool(rs_ping_notification_enabled) if rs_ping_notification_enabled is not None else True
 
         async def _send_server_notification(*, ref: str, message: str) -> None:
             await ws.send_text(json.dumps({"command": "server notification", "command_ref": ref, "message": message}))
@@ -960,7 +1044,6 @@ def create_app() -> FastAPI:
                 return
 
         async def _ping_loop() -> None:
-            nonlocal ws_closed
             if not ping_enabled:
                 return
             while True:
@@ -973,15 +1056,16 @@ def create_app() -> FastAPI:
                     # so we emit an application-level ping message to keep client listeners alive.
                     now_ms = int(time.time() * 1000)
                     await ws.send_text(json.dumps({"command": "ping", "command_ref": str(now_ms), "data": {}}))
-                    await ws.send_text(
-                        json.dumps(
-                            {
-                                "command": "server notification",
-                                "command_ref": "ping",
-                                "message": "ping",
-                            }
+                    if ping_notification_enabled:
+                        await ws.send_text(
+                            json.dumps(
+                                {
+                                    "command": "server notification",
+                                    "command_ref": "ping",
+                                    "message": "ping",
+                                }
+                            )
                         )
-                    )
                     await metrics.inc_down_out(str(conn_id))
                 except Exception:
                     async with auth_lock:
@@ -1069,6 +1153,12 @@ def create_app() -> FastAPI:
                             upstream_payload["args"] = {k: v for k, v in (upstream_payload.get("args") or {}).items() if k != "site_id"}
 
                         try:
+                            if await _overload_should_drop(str(conn_id)):
+                                await _send_downstream_response(ref=ref, success=False, error="overloaded")
+                                await metrics.inc_down_out(str(conn_id))
+                                return
+
+                            await _overload_inflight_inc(str(conn_id))
                             cached = None
                             if cmd in GET_COMMANDS:
                                 cached = await _get_cached_poll_response(site_id=site_id, command=cmd)
@@ -1103,6 +1193,8 @@ def create_app() -> FastAPI:
                                 await _send_downstream_response(ref=ref, success=False, error="invalid_upstream_response")
                         except Exception as e:
                             await _send_downstream_response(ref=ref, success=False, error=str(e)[:200])
+                        finally:
+                            await _overload_inflight_dec(str(conn_id))
 
                         await metrics.inc_down_out(str(conn_id))
 

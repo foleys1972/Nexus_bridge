@@ -21,6 +21,9 @@ def _utcnow() -> str:
 
 class PutSettingsRequest(BaseModel):
     bt_max_commands_per_second: int | None = None
+    downstream_overload_max_inflight: int | None = None
+    downstream_overload_hard_max_inflight: int | None = None
+    wba_ping_notification_enabled: bool | None = None
     log_base_path: str | None = None
     ldap: dict | None = None
 
@@ -85,12 +88,30 @@ async def get_settings(
     ldap_group_attr = _effective_str("LDAP_GROUP_ATTR", "ldap_group_attr", "memberOf")
     ldap_mail_attr = _effective_str("LDAP_MAIL_ATTR", "ldap_mail_attr", "mail")
 
+    effective_overload_soft = 100
+    effective_overload_hard = 200
+    if isinstance(rs, dict) and isinstance(rs.get("downstream_overload_max_inflight"), int):
+        effective_overload_soft = int(rs["downstream_overload_max_inflight"])
+    if isinstance(rs, dict) and isinstance(rs.get("downstream_overload_hard_max_inflight"), int):
+        effective_overload_hard = int(rs["downstream_overload_hard_max_inflight"])
+
+    effective_ping_notification_enabled = True
+    if isinstance(rs, dict) and "wba_ping_notification_enabled" in rs:
+        effective_ping_notification_enabled = str(rs.get("wba_ping_notification_enabled") or "").strip().lower() in {"1", "true", "yes", "on"}
+
     return {
         "bt_defaults": {
             "heartbeat_interval_seconds": cfg.bt_defaults.heartbeat_interval_seconds,
             "reconnect_attempts": cfg.bt_defaults.reconnect_attempts,
             "command_timeout_seconds": cfg.bt_defaults.command_timeout_seconds,
             "max_commands_per_second": effective_max_cps,
+        },
+        "overload_protection": {
+            "downstream_overload_max_inflight": effective_overload_soft,
+            "downstream_overload_hard_max_inflight": effective_overload_hard,
+        },
+        "wba": {
+            "ping_notification_enabled": bool(effective_ping_notification_enabled),
         },
         "logging": {
             "base_path": (rs.get("log_base_path") if isinstance(rs, dict) and isinstance(rs.get("log_base_path"), str) else None)
@@ -124,7 +145,14 @@ async def put_settings(
     db: Db = Depends(get_db),
     _user: dict = Depends(require_admin),
 ):
-    if body.bt_max_commands_per_second is None and body.log_base_path is None and body.ldap is None:
+    if (
+        body.bt_max_commands_per_second is None
+        and body.downstream_overload_max_inflight is None
+        and body.downstream_overload_hard_max_inflight is None
+        and body.wba_ping_notification_enabled is None
+        and body.log_base_path is None
+        and body.ldap is None
+    ):
         raise HTTPException(status_code=400, detail="invalid_request")
     if not hasattr(request.app.state, "runtime_settings") or not isinstance(request.app.state.runtime_settings, dict):
         request.app.state.runtime_settings = {}
@@ -145,6 +173,52 @@ async def put_settings(
                 ("bt_max_commands_per_second", str(int(body.bt_max_commands_per_second)), _utcnow()),
             )
             request.app.state.runtime_settings["bt_max_commands_per_second"] = int(body.bt_max_commands_per_second)
+
+        if body.downstream_overload_max_inflight is not None:
+            v = int(body.downstream_overload_max_inflight)
+            if v < 1 or v > 100_000:
+                raise HTTPException(status_code=400, detail="out_of_range")
+            await db.conn.execute(
+                """
+                INSERT INTO app_settings (key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                  value = excluded.value,
+                  updated_at = excluded.updated_at
+                """,
+                ("downstream_overload_max_inflight", str(v), _utcnow()),
+            )
+            request.app.state.runtime_settings["downstream_overload_max_inflight"] = v
+
+        if body.downstream_overload_hard_max_inflight is not None:
+            v = int(body.downstream_overload_hard_max_inflight)
+            if v < 1 or v > 100_000:
+                raise HTTPException(status_code=400, detail="out_of_range")
+            await db.conn.execute(
+                """
+                INSERT INTO app_settings (key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                  value = excluded.value,
+                  updated_at = excluded.updated_at
+                """,
+                ("downstream_overload_hard_max_inflight", str(v), _utcnow()),
+            )
+            request.app.state.runtime_settings["downstream_overload_hard_max_inflight"] = v
+
+        if body.wba_ping_notification_enabled is not None:
+            v = "1" if bool(body.wba_ping_notification_enabled) else "0"
+            await db.conn.execute(
+                """
+                INSERT INTO app_settings (key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                  value = excluded.value,
+                  updated_at = excluded.updated_at
+                """,
+                ("wba_ping_notification_enabled", v, _utcnow()),
+            )
+            request.app.state.runtime_settings["wba_ping_notification_enabled"] = v
 
         if body.log_base_path is not None:
             v = body.log_base_path.strip()

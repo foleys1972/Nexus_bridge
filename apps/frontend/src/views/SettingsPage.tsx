@@ -1,17 +1,22 @@
 import React from "react";
 
+import { apiFetch } from "../api";
+
 export function SettingsPage() {
   const apiBase = (import.meta as any).env?.VITE_API_BASE_URL || "http://localhost:3000";
   const [data, setData] = React.useState<any>(null);
   const [error, setError] = React.useState<string | null>(null);
   const [saving, setSaving] = React.useState(false);
   const [maxCpsDraft, setMaxCpsDraft] = React.useState<string>("");
+  const [overloadSoftDraft, setOverloadSoftDraft] = React.useState<string>("");
+  const [overloadHardDraft, setOverloadHardDraft] = React.useState<string>("");
+  const [pingNotificationEnabledDraft, setPingNotificationEnabledDraft] = React.useState<boolean>(true);
   const [logBasePathDraft, setLogBasePathDraft] = React.useState<string>("");
 
   const load = React.useCallback(async () => {
     setError(null);
     try {
-      const res = await fetch(`${apiBase}/api/settings`);
+      const res = await apiFetch("/api/settings");
       if (!res.ok) throw new Error(`failed_to_load_${res.status}`);
       const json = await res.json();
       setData(json);
@@ -23,6 +28,20 @@ export function SettingsPage() {
       if (typeof lbp === "string") {
         setLogBasePathDraft(lbp);
       }
+
+      const os = json?.overload_protection?.downstream_overload_max_inflight;
+      if (typeof os === "number") {
+        setOverloadSoftDraft(String(os));
+      }
+      const oh = json?.overload_protection?.downstream_overload_hard_max_inflight;
+      if (typeof oh === "number") {
+        setOverloadHardDraft(String(oh));
+      }
+
+      const pne = json?.wba?.ping_notification_enabled;
+      if (typeof pne === "boolean") {
+        setPingNotificationEnabledDraft(pne);
+      }
     } catch (e: any) {
       setError(e?.message ?? "failed_to_load");
     }
@@ -33,11 +52,16 @@ export function SettingsPage() {
     setSaving(true);
     try {
       const n = Number(maxCpsDraft);
-      const res = await fetch(`${apiBase}/api/settings`, {
+      const soft = Number(overloadSoftDraft);
+      const hard = Number(overloadHardDraft);
+      const res = await apiFetch("/api/settings", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           bt_max_commands_per_second: Math.max(1, Math.floor(n || 1)),
+          downstream_overload_max_inflight: Math.max(1, Math.floor(soft || 1)),
+          downstream_overload_hard_max_inflight: Math.max(1, Math.floor(hard || 1)),
+          wba_ping_notification_enabled: Boolean(pingNotificationEnabledDraft),
           log_base_path: logBasePathDraft
         })
       });
@@ -48,13 +72,13 @@ export function SettingsPage() {
     } finally {
       setSaving(false);
     }
-  }, [apiBase, load, maxCpsDraft]);
+  }, [apiBase, load, logBasePathDraft, maxCpsDraft, overloadHardDraft, overloadSoftDraft, pingNotificationEnabledDraft]);
 
   const saveLogging = React.useCallback(async () => {
     setError(null);
     setSaving(true);
     try {
-      const res = await fetch(`${apiBase}/api/settings`, {
+      const res = await apiFetch("/api/settings", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ log_base_path: logBasePathDraft })
@@ -108,7 +132,52 @@ export function SettingsPage() {
               </button>
             </div>
             <div className="mt-2 text-xs text-zinc-500">
-              Set via `.env` with `BT_MAX_COMMANDS_PER_SECOND` or via `config.yaml`.
+              Configurable here and persisted in the database. Defaults can come from `config.yaml`.
+            </div>
+          </div>
+
+          <div className="rounded border border-slate-800 bg-slate-900/40 p-3">
+            <div className="text-zinc-300 font-semibold">Overload Protection</div>
+            <div className="mt-2 text-sm text-zinc-400">
+              When overloaded, new BT-forwarded requests from the biggest offender are dropped.
+            </div>
+            <div className="mt-2 grid grid-cols-1 gap-3 md:grid-cols-2">
+              <div>
+                <div className="text-xs text-zinc-500">Soft max inflight</div>
+                <input
+                  className="w-full rounded border border-slate-800 bg-slate-900 p-2 font-mono text-zinc-200"
+                  type="number"
+                  min={1}
+                  value={overloadSoftDraft}
+                  onChange={(e) => setOverloadSoftDraft(e.target.value)}
+                />
+              </div>
+              <div>
+                <div className="text-xs text-zinc-500">Hard max inflight</div>
+                <input
+                  className="w-full rounded border border-slate-800 bg-slate-900 p-2 font-mono text-zinc-200"
+                  type="number"
+                  min={1}
+                  value={overloadHardDraft}
+                  onChange={(e) => setOverloadHardDraft(e.target.value)}
+                />
+              </div>
+            </div>
+            <div className="mt-2 text-xs text-zinc-500">
+              Soft limit drops only the worst offender. Hard limit drops all new forwarded requests until recovery.
+            </div>
+          </div>
+
+          <div className="rounded border border-slate-800 bg-slate-900/40 p-3">
+            <div className="text-zinc-300 font-semibold">WBA Compatibility</div>
+            <div className="mt-2 text-sm text-zinc-400">Ping server notifications</div>
+            <div className="mt-2 flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={pingNotificationEnabledDraft}
+                onChange={(e) => setPingNotificationEnabledDraft(e.target.checked)}
+              />
+              <div className="text-sm text-zinc-300">Enable legacy `server notification` ping messages</div>
             </div>
           </div>
 
